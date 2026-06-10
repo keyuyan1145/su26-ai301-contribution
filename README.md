@@ -3,8 +3,11 @@
 # Contribution 1: Try to determine the hostname for MongoDB connections
 
 **Contribution Number:** 1
+
 **Student:** Yuyan Ke 
+
 **Issue:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
+
 **Status:** Phase I Complete
 
 ---
