@@ -1,17 +1,19 @@
 # su26-ai301-contribution
 
-# Contribution [#]: [Issue Title]
+# Contribution 1: Try to determine the hostname for MongoDB connections
 
-**Contribution Number:** [1 / 2 / 3]  
-**Student:** [Your Name]  
-**Issue:** [GitHub issue link]  
-**Status:** [Phase I / Phase II / Phase III / Phase IV] [In Progress / Complete]
+**Contribution Number:** 1
+**Student:** Yuyan Ke 
+**Issue:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
+**Status:** Phase I Complete
 
 ---
 
 ## Why I Chose This Issue
 
 [1-2 paragraphs explaining why this issue interests you, how it matches your skills/learning goals, what you hope to learn]
+
+This issue deals with mongo database configuration, and given my background with system and recently starting to work more with Mongo DB at work, this issue offers an opportunity to dig into the Mongo configuration. Since this will be my very first open-source contribution, I'm hoping to learn and experience the end-to-end process first as a stepping stone. 
 
 ---
 
@@ -21,17 +23,25 @@
 
 [In your own words, what's broken or missing?]
 
+Mongo connection detail does not include hostname, so this issue is to determine the Mongo database hostname from the connection string. Hostname is more descriptive and human-friendly compared to IP addresses or random strings. 
+
 ### Expected Behavior
 
 [What should happen?]
+
+Upon successfully completion of this issue, Mongo DB hostname can be determined and logged based on connection string.
 
 ### Current Behavior
 
 [What actually happens?]
 
+Only Mongo conenction string is available, no hostname.
+
 ### Affected Components
 
-[Which par  ts of the codebase are involved?]
+[Which parts of the codebase are involved?]
+
+Code change in `go_mongo.c` , references available in `go_sql.c`, specifically the `read_mysql_hostname_from_mysqlconn()`.
 
 ---
 
