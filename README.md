@@ -82,7 +82,8 @@ Code change in `go_mongo.c` , references available in `go_sql.c`, specifically t
 
 Using UMPIRE framework (adapted):
 
-**Understand:** MongoDB spans produced by the eBPF instrumentation are missing the `server.address` attribute. The connection string (e.g., `mongodb://mongo:27017`) contains the hostname, but `go_mongo.c` never reads or stores it — the `mongo_go_client_req_t` struct has no hostname field, so the user-space transform has nothing to emit as `server.address`.
+**Understand:** 
+MongoDB spans produced by the eBPF instrumentation are missing the `server.address` attribute. The connection string (e.g., `mongodb://mongo:27017`) contains the hostname, but `go_mongo.c` never reads or stores it — the `mongo_go_client_req_t` struct has no hostname field, so the user-space transform has nothing to emit as `server.address`.
 
 **Match:**
 `go_sql.c` solves the identical problem for MySQL and PostgreSQL. It reads a hostname string by dereferencing a pointer chain from the driver connection struct into an internal config field (`mysqlConn.cfg.Addr`, `pgx.Conn.config.Host`). The offset for that field is registered in `go_offsets.h`, injected at eBPF load time, and the string is extracted with `read_go_str()`. The MongoDB equivalent pointer chain starts from the `Operation` struct (already available in `obi_uprobe_mongo_op_execute`) via its `Deployment` interface field, which holds a `*topology.Topology` whose `servers` map entry contains a `description.Server` with an `Addr` string field.
@@ -103,7 +104,6 @@ Using UMPIRE framework (adapted):
 - [ ] Transform sets `server.address` only when the hostname field is non-empty (avoid emitting blank attribute)
 - [ ] Contribution follows CONTRIBUTING.md — DCO sign-off on commits
 
-
 **Evaluate:**
 Run the OATS test locally after the fix:
 ​```bash
@@ -113,7 +113,6 @@ curl http://localhost:8080/mongo
 docker compose -f docker-compose-go-mongo.yml logs autoinstrumenter
 ​```
 The span for `insert testdb.items` should now include `server.address: mongo`. The OATS assertion in `oats_go_mongo.yaml` will also catch regressions automatically in CI.
----
 
 ## Testing Strategy
 
