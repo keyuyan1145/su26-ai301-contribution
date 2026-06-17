@@ -82,21 +82,37 @@ Code change in `go_mongo.c` , references available in `go_sql.c`, specifically t
 
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** MongoDB spans produced by the eBPF instrumentation are missing the `server.address` attribute. The connection string (e.g., `mongodb://mongo:27017`) contains the hostname, but `go_mongo.c` never reads or stores it — the `mongo_go_client_req_t` struct has no hostname field, so the user-space transform has nothing to emit as `server.address`.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:**
+`go_sql.c` solves the identical problem for MySQL and PostgreSQL. It reads a hostname string by dereferencing a pointer chain from the driver connection struct into an internal config field (`mysqlConn.cfg.Addr`, `pgx.Conn.config.Host`). The offset for that field is registered in `go_offsets.h`, injected at eBPF load time, and the string is extracted with `read_go_str()`. The MongoDB equivalent pointer chain starts from the `Operation` struct (already available in `obi_uprobe_mongo_op_execute`) via its `Deployment` interface field, which holds a `*topology.Topology` whose `servers` map entry contains a `description.Server` with an `Addr` string field.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:**
+1. **[bpf/common/common.h]** — Add `unsigned char hostname[k_sql_hostname_max_len]` field to `mongo_go_client_req_t` (mirror the same constant used by `sql_request_trace_t`).
+2. **[bpf/gotracer/go_offsets.h]** — Add a new offset entry (e.g., `_mongo_server_addr_pos`) for the address string field inside the MongoDB driver's topology server struct.
+3. **[bpf/gotracer/go_mongo.c]** — In `obi_uprobe_mongo_op_execute`, after reading `req->db`, dereference `Operation.Deployment` → `topology.Topology` → server address string and store it in `req->hostname` using `read_go_str()`.
+4. **[pkg/ebpf/common/mongo_detect_transform.go]** — Read `req.hostname` from the eBPF event and set it as the `server.address` span attribute (mirror how the SQL transform handles `trace.hostname`).
+5. **[internal/test/oats/mongo/yaml/oats_go_mongo.yaml]** — Add `server.address: 'mongo'` to the expected attributes on the MongoDB span assertion.
 
 **Implement:** [Link to your branch/commits as you work]
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:**
+- [ ] New struct field does not break struct layout alignment (padding may be needed)
+- [ ] Offset key follows the existing `_mongo_*` naming convention in `go_offsets.h`
+- [ ] `read_go_str` call is guarded with a `bpf_dbg_printk` on failure, matching the style of other reads in `go_mongo.c`
+- [ ] Transform sets `server.address` only when the hostname field is non-empty (avoid emitting blank attribute)
+- [ ] Contribution follows CONTRIBUTING.md — DCO sign-off on commits
 
-**Evaluate:** [How will you verify it works?]
 
+**Evaluate:**
+Run the OATS test locally after the fix:
+​```bash
+cd internal/test/oats/mongo
+docker compose -f docker-compose-go-mongo.yml up --build
+curl http://localhost:8080/mongo
+docker compose -f docker-compose-go-mongo.yml logs autoinstrumenter
+​```
+The span for `insert testdb.items` should now include `server.address: mongo`. The OATS assertion in `oats_go_mongo.yaml` will also catch regressions automatically in CI.
 ---
 
 ## Testing Strategy
