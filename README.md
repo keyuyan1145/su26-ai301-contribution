@@ -245,6 +245,90 @@ The span for `insert testdb.items` should now include `server.address: mongo`. T
 
 ---
 
+### Week 4 Progress (Jun 24 – Jul 1)
+
+**What I worked on:**
+- Switched from WSL2 to a VirtualBox Ubuntu VM due to ongoing compatibility issues — WSL2's older Microsoft kernel (5.10.x) lacked BTF support (`CONFIG_DEBUG_INFO_BTF`) required for eBPF, and Docker Desktop's seccomp profile was blocking basic process execution inside containers
+- Set up a fresh Ubuntu 20.04.1 VM on VirtualBox and confirmed the VM is running
+- Diagnosed remaining blockers on the VM before reproduction can proceed:
+  - Kernel 5.11.0-34-generic does not expose `/sys/kernel/btf/vmlinux` — BTF is missing, which will cause the autoinstrumenter to fail at startup with `kernel does not support BTF`
+  - Docker Compose v2 is not installed (only Docker 20.10.7 from Ubuntu's default repo)
+  - Need to reset VM credentials before applying system updates
+
+**Challenges faced:**
+- The WSL2 approach was abandoned after the autoinstrumenter crashed immediately with `kernel does not support BTF (CONFIG_DEBUG_INFO_BTF): no vmlinux BTF found` — the Microsoft-provided WSL2 kernel does not have BTF compiled in
+- MongoDB 8.3.1 also crashed inside the WSL2 Docker environment with `Operation not permitted` (seccomp blocking kernel calls), further confirming that WSL2 + Docker Desktop is not a viable environment for this project
+- VirtualBox Ubuntu VM has the same BTF gap — Ubuntu 20.04's default 5.11 HWE kernel does not enable `CONFIG_DEBUG_INFO_BTF`; needs upgrade to the 5.15 HWE kernel
+- Forgot VM sudo credentials — need to recover via GRUB recovery mode before running system updates
+
+**Next steps to complete reproduction:**
+1. Reset VM sudo password via VirtualBox GRUB recovery mode
+2. Upgrade the kernel to 5.15 HWE to enable BTF support
+3. Install Docker Compose v2
+4. Run the test stack using the steps below
+
+---
+
+### Local Reproduction Steps (Ubuntu VM)
+
+Follow these steps in order after the VM is fully configured.
+
+**Step 1 — Upgrade kernel for BTF support (required for eBPF)**
+```bash
+sudo apt update
+sudo apt install --install-recommends linux-generic-hwe-20.04
+sudo reboot
+```
+
+After reboot, verify:
+```bash
+uname -r
+# Should show 5.15.x
+
+ls /sys/kernel/btf/vmlinux && echo "BTF supported"
+```
+
+**Step 2 — Install Docker Compose v2**
+```bash
+DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+mkdir -p $DOCKER_CONFIG/cli-plugins
+curl -SL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
+  -o $DOCKER_CONFIG/cli-plugins/docker-compose
+chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+docker compose version
+```
+
+**Step 3 — Clone the repo on the working branch**
+```bash
+git clone https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation.git
+cd opentelemetry-ebpf-instrumentation
+git checkout mongo-connection
+```
+
+**Step 4 — Run the test stack**
+
+The `docker-compose-go-mongo-local.yml` file uses the published `otel/ebpf-instrument:latest` image for the autoinstrumenter instead of building from source. This is necessary because the eBPF-generated Go bindings (`*_bpfel.go`) are excluded from source control and require `clang` + `bpf2go` to generate — tools not available in a basic dev environment.
+```bash
+cd internal/test/oats/mongo
+docker compose -f docker-compose-go-mongo-local.yml up --build
+```
+
+**Step 5 — Trigger MongoDB operations (open a second terminal)**
+```bash
+curl http://localhost:8080/mongo
+```
+
+This runs InsertOne → FindOne → UpdateOne → FindOne → DeleteOne against the `testdb.items` collection.
+
+**Step 6 — Observe the span output**
+```bash
+docker compose -f docker-compose-go-mongo-local.yml logs autoinstrumenter
+```
+
+Look for span lines containing `insert`, `find`, `update`, `delete`. You should see `server.port: 27017` present but `server.address` absent — this confirms the bug this contribution is fixing.
+
+---
+
 ## Pull Request
 
 **PR Link:** [GitHub PR URL when submitted]
