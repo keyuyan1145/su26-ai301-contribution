@@ -329,6 +329,33 @@ Look for span lines containing `insert`, `find`, `update`, `delete`. You should 
 
 ---
 
+### Week 5 Progress (Jul 1–8)
+
+**What I worked on:**
+- Attempted to recover the Ubuntu VM sudo credentials via GRUB recovery mode — the GRUB menu opened but displayed an error screen instead of a usable menu
+- Tried the GRUB root shell approach (recovery mode) but it prompted for a root password, which was also unknown
+- Attempted the alternative GRUB method of editing boot parameters directly (`init=/bin/bash`) but the GRUB screen error prevented this
+- Decided to create a fresh Ubuntu VM rather than continue debugging the credential issue
+- Attempted to install Ubuntu 26.04 — the VM crashed on boot with a kernel panic: `Kernel panic - not syncing: Attempted to kill the idle task!`
+- Identified two root causes of the kernel panic:
+  - **Hyper-V conflict**: Docker Desktop enables Hyper-V on Windows 10, which conflicts with VirtualBox's hardware virtualization (VT-x/AMD-V) — both cannot run simultaneously
+  - **Ubuntu 26.04 incompatibility**: The downloaded Ubuntu 26.04 ISO is too new for the current VirtualBox version, which has not yet been updated to support it fully
+- Identified correct setup path going forward: use Ubuntu 22.04 LTS with VirtualBox 7.x after disabling Hyper-V
+
+**Challenges faced:**
+- GRUB recovery mode was inaccessible due to a screen error, and the root shell required an unknown root password — no straightforward way to reset credentials on the existing VM
+- Ubuntu 26.04 caused a kernel panic in VirtualBox — newer Ubuntu versions require a matching VirtualBox version to boot correctly
+- Hyper-V (used by Docker Desktop on Windows 10) and VirtualBox cannot run at the same time — this is a fundamental Windows 10 limitation that requires choosing one or the other per boot
+
+**Next steps to complete VM setup:**
+1. Run in PowerShell (admin) and reboot Windows: `bcdedit /set hypervisorlaunchtype off`
+2. Update VirtualBox to version 7.x from `https://www.virtualbox.org/wiki/Downloads`
+3. Download Ubuntu 22.04 LTS ISO from `https://ubuntu.com/download/desktop`
+4. Delete the broken VM and create a new one using Ubuntu 22.04 LTS
+5. After successful Ubuntu install, proceed with the reproduction steps documented above
+
+---
+
 ## Pull Request
 
 **PR Link:** [GitHub PR URL when submitted]
