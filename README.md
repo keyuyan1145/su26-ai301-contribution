@@ -8,7 +8,7 @@
 
 **Issue:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
 
-**Status:** Phase I Complete
+**Status:** Phase II Complete
 
 ---
 
@@ -186,7 +186,187 @@ The HTTP destination correctly shows `testserver.integration-test` as the name b
 
 ### Analysis
 
-[Your analysis of the root cause - what's causing the issue?]
+This section traces the full path a MongoDB operation travels through the system — from the Go application making a database call all the way to the span that gets emitted by the eBPF instrumentation. Understanding this path makes it clear exactly where the hostname is lost and where the fix needs to go.
+
+---
+
+#### Actor 1: The Go Application
+**File:** `internal/test/integration/components/gomongo/main.go`
+
+The test server connects to MongoDB using the connection string `mongodb://mongo:27017`. The hostname `"mongo"` is embedded in that URI. When a request comes in, it calls the standard MongoDB Go driver methods: `InsertOne`, `FindOne`, `UpdateOne`, `DeleteOne`. The application itself never explicitly extracts the hostname — it just passes the URI to the driver and trusts it handles routing.
+
+---
+
+#### Actor 2: The MongoDB Go Driver (library code)
+**Package:** `go.mongodb.org/mongo-driver/v2`
+
+The driver parses the connection URI and stores the hostname internally in a `topology.Topology` struct. When a collection operation is called (e.g., `InsertOne`), the driver routes through two internal types:
+- `Collection` — holds the collection name and a reference back to the client/database
+- `driver.Operation` — the low-level execution unit, which holds:
+  - `Database` (string) — the database name
+  - `Deployment` (interface) — typically a `*topology.Topology` that knows which servers exist, including their hostnames
+
+`Operation.Execute(ctx)` is the method that does the actual network send. This is the function the eBPF probes hook into.
+
+---
+
+#### Actor 3: eBPF Probes in the Kernel
+**File:** `bpf/gotracer/go_mongo.c`
+
+Three uprobes intercept driver calls at runtime by hooking into specific memory addresses in the running process:
+
+**Probe 1 — `obi_uprobe_mongo_coll_op()`**
+Fires when any collection-level operation starts (insert, find, update, delete, etc.). Reads the `Collection.name` field from the struct in memory using `read_go_str()`, records the operation type (e.g., `"insert"`), and stores the partial event in an eBPF hash map (`ongoing_mongo_requests`) keyed by goroutine ID.
+
+**Probe 2 — `obi_uprobe_mongo_op_execute()`**
+Fires when `Operation.Execute()` is called. Reads `Operation.Database` from the struct and adds it to the map entry for the current goroutine. **This is the right place to also read the hostname** — the `Operation.Deployment` field (accessible from the same `Operation` struct pointer) leads to the topology, which holds the server address. Currently, this probe stops after reading the database name and never follows the `Deployment` pointer to extract the hostname.
+
+**Probe 3 — `obi_uprobe_mongo_op_execute_ret()`**
+Fires when `Operation.Execute()` returns. Reads the error status, copies the complete struct from the eBPF map to the **ring buffer** (a shared kernel-to-user-space data channel), and removes the map entry. At this point the event is sent to user space.
+
+---
+
+#### Actor 4: The Event Struct — the missing field
+**File:** `bpf/common/common.h`
+
+The data that crosses from kernel space to user space is a C struct called `mongo_go_client_req_t`:
+
+```c
+typedef struct mongo_go_client_req {
+    u8 type;
+    u8 err;
+    u8 _pad[6];
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    pid_info pid;
+    unsigned char op[32];    // operation name, e.g. "insert"
+    unsigned char db[32];    // database name, e.g. "testdb"
+    unsigned char coll[32];  // collection name, e.g. "items"
+    connection_info_t conn;  // IP addresses and ports (numeric only)
+    tp_info_t tp;            // trace context (trace ID, span ID)
+} mongo_go_client_req_t;
+```
+
+There is no `hostname` field. Even if the kernel probe read the hostname successfully, there is nowhere to put it — the struct cannot carry it to user space. This is why adding a `hostname` field here is step one of the fix.
+
+---
+
+#### Actor 5: User-Space Transform
+**File:** `pkg/ebpf/common/mongo_detect_transform.go` — function `ReadGoMongoRequestIntoSpan()`
+
+This function reads the raw `mongo_go_client_req_t` bytes off the ring buffer and converts them into a `request.Span` (the internal OTel span representation). The relevant lines:
+
+```go
+if event.Conn.S_port != 0 || event.Conn.D_port != 0 {
+    peer, hostname = (*BPFConnInfo)(unsafe.Pointer(&event.Conn)).reqHostInfo()
+    hostPort = int(event.Conn.D_port)
+}
+```
+
+`reqHostInfo()` derives a "hostname" from the IP-level connection info in `event.Conn`. Since `Conn` only contains raw IP addresses (captured from the network packet), `hostname` ends up as the IP string `"172.18.0.3"` — not the DNS name `"mongo"`. The span is created with `Host: hostname`, which becomes `server.address` in the final OTel span.
+
+Because the `mongo_go_client_req_t` struct has no hostname field, this function has no way to set `server.address` to the actual hostname — even though the driver knew it all along.
+
+---
+
+#### Root Cause Summary
+
+The diagram below traces a single `curl` call end-to-end and shows exactly where the hostname disappears:
+
+```
+USER
+  │
+  │  curl http://localhost:8080/mongo
+  ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Go Test Server  (gomongo/main.go, port 8080)               │
+│                                                             │
+│  On startup:  client, _ = mongo.Connect(                    │
+│                 "mongodb://mongo:27017")   ← hostname here  │
+│                                                             │
+│  On /mongo:   coll.InsertOne(...)                           │
+│               coll.FindOne(...)                             │
+│               coll.UpdateOne(...)    ← driver calls         │
+│               coll.FindOne(...)                             │
+│               coll.DeleteOne(...)                           │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  each driver call eventually reaches
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MongoDB Go Driver  (go.mongodb.org/mongo-driver/v2)        │
+│                                                             │
+│  Connection URI parsed at startup:                          │
+│    "mongodb://mongo:27017"                                  │
+│     → hostname "mongo" stored in topology.Topology          │
+│                                                             │
+│  Per operation:                                             │
+│    Collection.InsertOne()                                   │
+│      → driver.Operation{                                    │
+│            Database:   "testdb",                            │
+│            Deployment: *topology.Topology  ← "mongo" here  │
+│          }.Execute(ctx)    ← eBPF hooks here                │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  Operation.Execute() called
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  eBPF Probes in kernel  (bpf/gotracer/go_mongo.c)           │
+│                                                             │
+│  Probe 1 — obi_uprobe_mongo_coll_op()                       │
+│    fires on: Collection.Insert / Find / Update / Delete     │
+│    reads:    Collection.name  → req.coll = "items"          │
+│    reads:    op type          → req.op   = "insert"         │
+│    stores:   partial req in ongoing_mongo_requests map      │
+│                                                             │
+│  Probe 2 — obi_uprobe_mongo_op_execute()                    │
+│    fires on: Operation.Execute() entry                      │
+│    reads:    Operation.Database → req.db = "testdb"         │
+│    MISSING:  Operation.Deployment → topology → "mongo"  ✗   │
+│    stores:   updated req in map                             │
+│                                                             │
+│  Probe 3 — obi_uprobe_mongo_op_execute_ret()                │
+│    fires on: Operation.Execute() return                     │
+│    reads:    error status                                   │
+│    submits:  mongo_go_client_req_t to ring buffer           │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  ring buffer event (kernel → user space)
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  mongo_go_client_req_t  (bpf/common/common.h)               │
+│                                                             │
+│    op[32]   = "insert"                                      │
+│    db[32]   = "testdb"                                      │
+│    coll[32] = "items"                                       │
+│    conn     = { src_ip: 172.18.0.2, dst_ip: 172.18.0.3,    │
+│                 dst_port: 27017 }   ← IPs only, no name     │
+│    hostname = ??? field does not exist  ✗                   │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  ReadGoMongoRequestIntoSpan()
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  User-Space Transform  (mongo_detect_transform.go)          │
+│                                                             │
+│    hostname = reqHostInfo(event.Conn)                       │
+│             = "172.18.0.3"   ← IP only, no DNS name         │
+│                                                             │
+│    Span.Host     = "172.18.0.3"                             │
+│    Span.HostPort = 27017                                    │
+└──────────────────┬──────────────────────────────────────────┘
+                   │
+                   ▼
+  OTel Span output:
+    MongoClient insert testdb.items
+      server.port    = 27017       ✓
+      server.address = 172.18.0.3  ✗  (should be "mongo")
+```
+
+**Why the hostname is lost:** The driver stored `"mongo"` inside its `topology.Topology` struct the whole time, but Probe 2 never follows the `Operation.Deployment` pointer to reach it. With no hostname in the event struct and no hostname field to carry it across the kernel/user boundary, the transform falls back to the raw destination IP.
+
+The fix requires three things working together:
+1. **`go_mongo.c`** — Probe 2 must dereference `Operation.Deployment → topology.Topology → server address` and store it in `req.hostname`
+2. **`common.h`** — `mongo_go_client_req_t` must gain a `hostname` field to carry the string across the ring buffer
+3. **`mongo_detect_transform.go`** — `ReadGoMongoRequestIntoSpan` must read `event.Hostname` and use it as `Host` in the span instead of falling back to the IP
+
+The SQL instrumentation in `bpf/gotracer/go_sql.c` already does this exact pattern for MySQL and PostgreSQL — `read_mysql_hostname_from_mysqlconn()` and `read_pgx_hostname_from_conn()` serve as direct references for the MongoDB equivalent.
 
 ### Proposed Solution
 
