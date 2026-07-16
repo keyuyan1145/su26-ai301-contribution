@@ -186,6 +186,37 @@ The HTTP destination correctly shows `testserver.integration-test` as the name b
 
 ### Analysis
 
+#### Actual vs Expected
+
+After running `curl http://localhost:8080/mongo`, the autoinstrumenter emits one span per MongoDB operation. The issue is visible in the destination address shown in each span line.
+
+**Actual output (current behavior):**
+```
+MongoClient insert testdb.items  [172.18.0.2 as testserver:0]->[172.18.0.3 as 172.18.0.3:27017]
+```
+
+The destination is `172.18.0.3 as 172.18.0.3:27017` — the server is identified only by its raw IP address. The NameResolver debug log confirms no hostname was resolved:
+```
+type=MongoClient host_ip=172.18.0.3 host_name=172.18.0.3 peer_ip=172.18.0.2 peer_name=testserver
+```
+`host_name` equals `host_ip` — no hostname was ever captured, so the IP is used as a fallback.
+
+**Expected output (after fix):**
+```
+MongoClient insert testdb.items  [172.18.0.2 as testserver:0]->[172.18.0.3 as mongo:27017]
+```
+
+The destination should show `mongo:27017` — the hostname from the connection string `mongodb://mongo:27017`. In OTel span attributes this maps to:
+
+| Attribute | Actual | Expected |
+|---|---|---|
+| `server.address` | `172.18.0.3` | `mongo` |
+| `server.port` | `27017` | `27017` (already correct) |
+
+The Go test server connects using `mongodb://mongo:27017`, so the driver knows the hostname is `"mongo"` — it is stored internally in the driver's topology struct. The problem is that the eBPF probe never reads it from there, so it never reaches the span.
+
+---
+
 This section traces the full path a MongoDB operation travels through the system — from the Go application making a database call all the way to the span that gets emitted by the eBPF instrumentation. Understanding this path makes it clear exactly where the hostname is lost and where the fix needs to go.
 
 ---
