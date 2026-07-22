@@ -8,7 +8,7 @@
 
 **Issue:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
 
-**Status:** Phase II Complete
+**Status:** Implementation Complete — Testing in Progress
 
 ---
 
@@ -414,7 +414,7 @@ MongoDB spans produced by the eBPF instrumentation are missing the `server.addre
 `go_sql.c` solves the identical problem for MySQL and PostgreSQL. It reads a hostname string by dereferencing a pointer chain from the driver connection struct into an internal config field (`mysqlConn.cfg.Addr`, `pgx.Conn.config.Host`). The offset for that field is registered in `go_offsets.h`, injected at eBPF load time, and the string is extracted with `read_go_str()`. The MongoDB equivalent pointer chain starts from the `Operation` struct (already available in `obi_uprobe_mongo_op_execute`) via its `Deployment` interface field, which holds a `*topology.Topology` whose `servers` map entry contains a `description.Server` with an `Addr` string field.
 
 **Plan:**
-1. **[bpf/common/common.h]** — Add `unsigned char hostname[k_sql_hostname_max_len]` field to `mongo_go_client_req_t` (mirror the same constant used by `sql_request_trace_t`).
+1. **[bpf/common/common.h]** — Add `unsigned char hostname[k_mongo_hostname_max_len]` field to `mongo_go_client_req_t`. Define a dedicated `k_mongo_hostname_max_len = 96` constant rather than reusing `k_sql_hostname_max_len` — MongoDB hostnames are shorter than full SQL payloads (96 bytes is sufficient for `"hostname:27017"`) and keeping it separate avoids coupling two unrelated protocols.
 2. **[bpf/gotracer/go_offsets.h]** — Add a new offset entry (e.g., `_mongo_server_addr_pos`) for the address string field inside the MongoDB driver's topology server struct.
 3. **[bpf/gotracer/go_mongo.c]** — In `obi_uprobe_mongo_op_execute`, after reading `req->db`, dereference `Operation.Deployment` → `topology.Topology` → server address string and store it in `req->hostname` using `read_go_str()`.
 4. **[pkg/ebpf/common/mongo_detect_transform.go]** — Read `req.hostname` from the eBPF event and set it as the `server.address` span attribute (mirror how the SQL transform handles `trace.hostname`).
@@ -458,7 +458,7 @@ The span for `insert testdb.items` should now include `server.address: mongo`. T
 
 ---
 
-## Implementation Notes
+## Weekly Progress
 
 ### Week 3 Progress (Jun 17–24)
 
@@ -597,6 +597,220 @@ Look for span lines containing `insert`, `find`, `update`, `delete`. You should 
 3. Download Ubuntu 22.04 LTS ISO from `https://ubuntu.com/download/desktop`
 4. Delete the broken VM and create a new one using Ubuntu 22.04 LTS
 5. After successful Ubuntu install, proceed with the reproduction steps documented above
+
+---
+
+### Week 7 Progress (Jul 15–21)
+
+**What I worked on:**
+- **Step 1** (`bpf/common/common.h`): Added `k_mongo_hostname_max_len = 96` constant and `unsigned char hostname[k_mongo_hostname_max_len]` field to `mongo_go_client_req_t` so the hostname can be carried across the kernel/user-space boundary
+- **Step 2** (`bpf/gotracer/go_offsets.h`, `pkg/internal/goexec/structmembers.go`): Registered 4 new offset keys (`_mongo_deployment_pos`, `_mongo_topo_cfg_pos`, `_mongo_cfg_seedlist_pos`, `_mongo_server_addr_pos`) and 6 struct field registrations (v1 + v2 for `topology.Topology`, `topology.Config`, `topology.Server`) so the offset injection system can locate the hostname pointer chain at load time
+- **Step 3** (`bpf/gotracer/go_mongo.c`): Added `read_mongo_hostname_from_operation()` helper that walks `Operation.Deployment → *topology.Topology → cfg (*Config) → SeedList[0]` and writes the result to `req->hostname`; called non-fatally from `obi_uprobe_mongo_op_execute`
+- **Step 4** (`pkg/ebpf/common/mongo_detect_transform.go`): Updated `ReadGoMongoRequestIntoSpan()` to read `event.Hostname`, strip the port suffix, and set `HostName` on the returned span so it maps to `server.address`
+- **Step 5** (`internal/test/oats/mongo/yaml/oats_go_mongo.yaml`): Added `server.address: mongo` assertion to the insert span test case
+
+**Branch:** [mongo-connection](https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation/tree/mongo-connection)
+
+---
+
+## Implementation Notes
+
+This section documents the exact changes made in each implementation step and why each piece was necessary.
+
+---
+
+### Step 1 — Add hostname field to the event struct
+
+**File:** `bpf/common/common.h`
+
+A new constant was added to the existing constants enum, and a new field was added to `mongo_go_client_req_t`. This struct is the data packet that travels from kernel space (eBPF) to user space — without a field here, any hostname the eBPF probe reads would have nowhere to go.
+
+```c
+// Added constant (after k_mongo_max_len):
+k_mongo_max_len = 256,
+k_mongo_hostname_max_len = 96,
+
+// Updated struct:
+typedef struct mongo_go_client_req {
+    u8 type;
+    u8 err;
+    u8 _pad[6];
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    pid_info pid;
+    unsigned char op[32];
+    unsigned char db[32];
+    unsigned char coll[32];
+    unsigned char hostname[k_mongo_hostname_max_len];  // NEW
+    connection_info_t conn;
+    tp_info_t tp;
+} mongo_go_client_req_t;
+```
+
+`k_mongo_hostname_max_len = 96` is sized for typical MongoDB hostnames with port (e.g., `"my-mongo-server.internal:27017"` fits well within 96 bytes). Using a dedicated constant instead of reusing `k_sql_hostname_max_len` keeps the two protocols independent — a future change to SQL sizing won't silently affect MongoDB.
+
+---
+
+### Step 2 — Register offset keys for the pointer chain
+
+**File:** `bpf/gotracer/go_offsets.h` and `pkg/internal/goexec/structmembers.go`
+
+The eBPF program cannot hard-code field offsets because Go struct layouts differ between compiler versions and driver releases. Instead, the project's offset injection system discovers the byte offset of each field at load time (via DWARF debug info or `offsets.json`) and stores them in a BPF map. eBPF code calls `go_offset_of(ot, key)` to retrieve the offset at runtime.
+
+Four new enum keys were added to the C header (in the `// go mongodb` block, preserving exact ordering with the Go iota constants):
+
+```c
+// go mongodb
+_mongo_conn_name_pos,
+_mongo_op_name_pos,
+_mongo_db_name_pos,
+_mongo_op_name_new,
+_mongo_server_addr_pos,    // topology.Server.address
+_mongo_deployment_pos,     // Operation.Deployment interface
+_mongo_topo_cfg_pos,       // topology.Topology.cfg
+_mongo_cfg_seedlist_pos,   // topology.Config.SeedList
+```
+
+Matching Go constants were added to `structmembers.go` (the comment on that file explicitly warns the order must match `go_offsets.h`):
+
+```go
+MongoServerAddrPos      // topology.Server.address
+MongoDeploymentPos      // Operation.Deployment
+MongoTopoCfgPos         // topology.Topology.cfg
+MongoCfgSeedlistPos     // Config.SeedList
+```
+
+`Deployment` was also added to the existing `driver.Operation` struct registrations (both v1 and v2), and six new struct registrations were added for `topology.Server`, `topology.Topology`, and `topology.Config`/`topology.config` — the last two differ between v1 (lowercase, unexported) and v2 (uppercase, exported):
+
+```go
+"go.mongodb.org/mongo-driver/x/mongo/driver/topology.config": {
+    lib: "go.mongodb.org/mongo-driver",
+    fields: map[string]GoOffset{"seedList": MongoCfgSeedlistPos},  // v1: unexported
+},
+"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology.Config": {
+    lib: "go.mongodb.org/mongo-driver",
+    fields: map[string]GoOffset{"SeedList": MongoCfgSeedlistPos},  // v2: exported
+},
+```
+
+---
+
+### Step 3 — Implement the hostname extraction helper in eBPF
+
+**File:** `bpf/gotracer/go_mongo.c`
+
+A new helper function `read_mongo_hostname_from_operation()` was added before `obi_uprobe_mongo_coll_op`. It follows the pointer chain `Operation.Deployment → *topology.Topology → cfg (*Config) → SeedList[0]` in four steps, each guarded with a debug print:
+
+```c
+static __always_inline bool
+read_mongo_hostname_from_operation(void *op_ptr, off_table_t *ot, mongo_go_client_req_t *req) {
+    bpf_dbg_printk("=== read_mongo_hostname_from_operation op_ptr=%llx ===", op_ptr);
+
+    // Step 1: Deployment is a Go interface {itab (8b), data ptr (8b)}.
+    //         +8 skips the itab to get the concrete *topology.Topology pointer.
+    u64 deployment_offset = go_offset_of(ot, (go_offset){.v = _mongo_deployment_pos});
+    void *topology_ptr = NULL;
+    bpf_probe_read(&topology_ptr, sizeof(topology_ptr),
+                   (void *)((u64)op_ptr + deployment_offset + 8));
+
+    // Step 2: topology.Topology.cfg is a *Config pointer.
+    u64 cfg_offset = go_offset_of(ot, (go_offset){.v = _mongo_topo_cfg_pos});
+    void *cfg_ptr = NULL;
+    bpf_probe_read(&cfg_ptr, sizeof(cfg_ptr),
+                   (void *)((u64)topology_ptr + cfg_offset));
+
+    // Step 3: Config.SeedList is a []string slice {array_ptr, len, cap}.
+    //         Reading 8 bytes gives the pointer to the underlying string array.
+    u64 seedlist_offset = go_offset_of(ot, (go_offset){.v = _mongo_cfg_seedlist_pos});
+    void *seedlist_array_ptr = NULL;
+    bpf_probe_read(&seedlist_array_ptr, sizeof(seedlist_array_ptr),
+                   (void *)((u64)cfg_ptr + seedlist_offset));
+
+    // Step 4: SeedList[0] is the first Go string {data_ptr, len} at offset 0.
+    read_go_str("server addr", seedlist_array_ptr, 0,
+                req->hostname, sizeof(req->hostname));
+
+    return true;
+}
+```
+
+Two key differences from the SQL pattern (MySQL/pgx use a simple 2-hop pointer chase):
+- **Interface dereference**: `Deployment` is a `driver.Deployment` interface. A Go interface is 16 bytes: 8 bytes of itab pointer followed by 8 bytes of data pointer. Adding `+8` to `deployment_offset` skips the itab and lands on the concrete `*topology.Topology` pointer.
+- **Slice traversal**: `SeedList` is a `[]string`, not a plain string. A Go slice header is `{array_ptr, len, cap}`. Reading the first 8 bytes gives the pointer to the string array, and `read_go_str(array_ptr, 0, ...)` reads the first string at element offset 0.
+
+The function is called non-fatally from `obi_uprobe_mongo_op_execute` — if extraction fails for any reason, the span is still emitted with an empty `server.address` rather than being dropped:
+
+```c
+// Non-fatal: the span is still emitted if hostname extraction fails.
+if (read_mongo_hostname_from_operation(op_ptr, ot, req)) {
+    bpf_dbg_printk("mongo hostname extracted: %s", req->hostname);
+} else {
+    bpf_dbg_printk("mongo hostname extraction failed, server.address will be empty");
+}
+```
+
+---
+
+### Step 4 — Read hostname in the user-space transform
+
+**File:** `pkg/ebpf/common/mongo_detect_transform.go`
+
+`ReadGoMongoRequestIntoSpan()` was updated to read `event.Hostname` from the eBPF event struct and set it as `HostName` on the span. Port stripping handles the fact that `SeedList[0]` is `"mongo:27017"` not just `"mongo"`:
+
+```go
+hostName := cstr(event.Hostname[:])
+slog.Debug("mongo transform: raw hostname from eBPF event", "raw_hostname", hostName)
+if idx := strings.LastIndex(hostName, ":"); idx != -1 {
+    hostName = hostName[:idx]
+    slog.Debug("mongo transform: stripped port from hostname", "hostname", hostName)
+}
+```
+
+The span is returned with both `Host` (IP from `reqHostInfo()`) and `HostName` (DNS name from the driver) set:
+
+```go
+return &request.Span{
+    ...
+    Host:     host,      // IP address from connection packet
+    HostName: hostName,  // DNS hostname from SeedList[0]
+    HostPort: hostPort,
+    ...
+}
+```
+
+`slog.Debug` is used (not `fmt.Println`) because the codebase routes all structured logging through `log/slog` — these messages only appear when `OTEL_EBPF_LOG_LEVEL=DEBUG` is set, matching the same convention used by the SQL transform.
+
+---
+
+### Step 5 — Update the OATS test assertion
+
+**File:** `internal/test/oats/mongo/yaml/oats_go_mongo.yaml`
+
+A single line was added to the insert span assertion to verify `server.address` is populated with the hostname from the connection string:
+
+```yaml
+- traceql: '{ .db.operation.name = "insert" && .db.system.name = "mongodb" }'
+  equals: insert testdb.items
+  attributes:
+    db.collection.name: testdb.items
+    server.address: mongo    # NEW — hostname from "mongodb://mongo:27017"
+    server.port: '27017'
+```
+
+`mongo` is the Docker Compose service name used in the test stack's connection string `mongodb://mongo:27017`. The OATS framework runs this test end-to-end: it starts the Docker Compose stack, sends a `curl /mongo` request, collects the emitted trace, and asserts each attribute matches.
+
+To run this test on the VM:
+
+```bash
+# From the repo root
+make oats-test-mongo
+```
+
+This calls `oats-prereq` (which runs `docker-generate` to build the autoinstrumenter from source) then runs Ginkgo against the YAML suite. To watch debug output from the eBPF probe while the test runs:
+
+```bash
+sudo cat /sys/kernel/debug/tracing/trace_pipe | grep mongo
+```
 
 ---
 
