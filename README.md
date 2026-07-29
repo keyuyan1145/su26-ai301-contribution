@@ -613,6 +613,83 @@ Look for span lines containing `insert`, `find`, `update`, `delete`. You should 
 
 ---
 
+### Week 9 Progress (Jul 22–29)
+
+**What I worked on:**
+- Installed Go 1.25 on the Ubuntu VM (was missing from PATH), then successfully ran `make oats-test-mongo` for the first time
+- The test ran end-to-end (23 min 41 sec, 3 specs) and confirmed the eBPF probe is firing and producing spans — 2 of 3 specs passed, 1 failed
+- Diagnosed the failure using `bpf_trace_printk` output from `/sys/kernel/debug/tracing/trace_pipe`
+
+**Test failure output:**
+```
+Summarizing 1 Failure:
+  [FAIL] test case [It] run-oats_go_mongo [docker, integration, slow]
+
+Ran 3 of 3 Specs in 1415.842 seconds
+FAIL! -- 2 Passed | 1 Failed | 0 Pending | 0 Skipped
+--- FAIL: TestYaml (1415.85s)
+
+Expected
+    "server.address": "172.18.0.3",
+to have {key: value}
+    "server.address": "mongo",
+```
+
+**eBPF kernel trace (from `/sys/kernel/debug/tracing/trace_pipe`):**
+```
+testserver [000] bpf_trace_printk: === read_mongo_hostname_from_operation op_ptr=1e068931bf10 ===
+testserver [000] bpf_trace_printk: step1: deployment_offset=0
+testserver [000] bpf_trace_printk: step1 failed: can't find mongo deployment offset
+testserver [000] bpf_trace_printk: mongo hostname extraction failed, server.address will be empty
+```
+
+**Root cause — DWARF scanner exits early before reaching `Deployment`:**
+
+The offset injection system reads struct field byte offsets from two sources: DWARF debug info in the binary, or a pre-fetched `offsets.json` fallback. `Database` and `Name` are already in `offsets.json`, so they work even when the DWARF scan fails. `Deployment` is not in `offsets.json` (it was never previously needed), so it depends entirely on the DWARF scan.
+
+The DWARF scan was failing before reaching `Deployment` due to two bugs in `readMembers()` in `pkg/internal/goexec/structmembers.go`:
+
+1. **Unsafe type assertion**: `attrs[dwarf.AttrName].(string)` panics when a DWARF member entry has no name attribute (which can happen for anonymous or function-type fields in `driver.Operation`). The panic silently aborts the scan.
+2. **Early return on non-constant location**: when a field's `DW_AT_data_member_location` is not a simple `int64`, the function returns an error that propagates up and stops the entire DWARF scan for the struct — all remaining fields (including `Deployment`) are never seen.
+
+Because `Deployment` appears later in the struct than the problematic field(s), it was consistently missed. The pre-fetched fallback then runs, finds `Database` and `Name` (both in `offsets.json`), but has no entry for `Deployment`, leaving its offset as 0.
+
+**Fix applied (`pkg/internal/goexec/structmembers.go` — `readMembers` function):**
+- Added nil check before the type assertion: if `attrs[dwarf.AttrName]` is nil, log a debug message and `continue` to the next DWARF entry instead of panicking
+- Changed the non-constant location error return to a debug log + `continue`, so the scanner keeps going through all remaining struct fields instead of aborting early
+- Added `slog.Debug` log lines for both skip paths so the cause is visible when `OTEL_EBPF_LOG_LEVEL=DEBUG`
+
+```go
+// Before
+if constName, ok := fields[attrs[dwarf.AttrName].(string)]; ok { ... }
+
+// After
+nameVal := attrs[dwarf.AttrName]
+if nameVal == nil {
+    log.Debug("skipping DWARF member entry with no name attribute", "tag", entry.Tag)
+    continue
+}
+name, ok := nameVal.(string)
+if !ok {
+    log.Debug("skipping DWARF member entry with non-string name", "name", nameVal, "tag", entry.Tag)
+    continue
+}
+if constName, ok := fields[name]; ok {
+    ...
+    } else {
+        log.Debug("skipping field with non-constant member location, will try pre-fetched offsets",
+            "field", name, "location", value)
+        // continue scanning instead of returning error early
+    }
+}
+```
+
+**Next step:** Push the fix and rerun `make oats-test-mongo` to verify `deployment_offset` is now non-zero and `server.address: mongo` passes.
+
+**Branch:** [mongo-connection](https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation/tree/mongo-connection)
+
+---
+
 ## Implementation Notes
 
 This section documents the exact changes made in each implementation step and why each piece was necessary.
