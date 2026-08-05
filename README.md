@@ -613,7 +613,7 @@ Look for span lines containing `insert`, `find`, `update`, `delete`. You should 
 
 ---
 
-### Week 9 Progress (Jul 22–29)
+### Week 8 Progress (Jul 22–29)
 
 **What I worked on:**
 - Installed Go 1.25 on the Ubuntu VM (was missing from PATH), then successfully ran `make oats-test-mongo` for the first time
@@ -685,6 +685,64 @@ if constName, ok := fields[name]; ok {
 ```
 
 **Next step:** Push the fix and rerun `make oats-test-mongo` to verify `deployment_offset` is now non-zero and `server.address: mongo` passes.
+
+**Branch:** [mongo-connection](https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation/tree/mongo-connection)
+
+---
+
+### Week 9 Progress (Jul 29 – Aug 5)
+
+**What I worked on:**
+
+**Finding the real root cause of `deployment_offset=0`**
+
+Even after the Week 8 DWARF scanner fix and adding `Deployment` to `offsets.json`, the kernel trace still showed `deployment_offset=0`. Something was still wrong.
+
+After digging deeper, I found a second, completely separate problem: a hardcoded whitelist.
+
+In `pkg/internal/ebpf/gotracer/gotracer.go`, there's a function called `RegisterOffsets`. Think of it like a checklist — OBI computes the byte offset for every field it knows about, but only *writes* the offsets that appear on this checklist into the eBPF map (the shared memory table the kernel probe reads from). Our 4 new constants (`MongoServerAddrPos`, `MongoDeploymentPos`, `MongoTopoCfgPos`, `MongoCfgSeedlistPos`) were computed correctly but were never on the checklist, so they were silently thrown away. The eBPF map never received them. That's why the kernel always saw `deployment_offset=0` — the value was calculated, but never delivered.
+
+Fix: added all 4 new constants to the `RegisterOffsets` whitelist in `gotracer.go`.
+
+**Verifying the `Deployment` byte offset**
+
+I also verified the `offsets.json` fallback value is correct. On the VM, I wrote a tiny Go program that uses `unsafe.Offsetof` — a compile-time builtin that tells you exactly how many bytes from the start of a struct a field lives at. It printed `24`, confirming the entry already added to `offsets.json` is correct.
+
+**New test failure after the fix: HTTP 500 / MongoDB not starting**
+
+After applying both fixes and rerunning `make oats-test-mongo`, the test failed in a new way: the testserver was returning HTTP 500 on `/mongo`, and the kernel trace showed `mongo_conn=0` with no hostname extraction messages at all. This means the MongoDB container itself never started, so the testserver had nothing to connect to.
+
+The root cause was in the Docker logs:
+```
+DBException in initAndListen, terminating
+FileStreamFailed: Unable to write string 1 to file: /data/db/mongod.lock
+No space left on device
+```
+
+MongoDB couldn't even write its lock file because the VM disk was completely full. When a database can't start, the app server gets a connection error and returns HTTP 500 — nothing to do with our eBPF code at all.
+
+**Cause of disk exhaustion:** Docker had accumulated gigabytes of image layers, build caches, and volumes from all the previous test runs. Each `make oats-test-mongo` run downloads and builds new images; with no cleanup between runs they piled up.
+
+**Fix: cleared all Docker state**
+```bash
+docker system prune -a --volumes -f
+go clean -cache -modcache
+```
+
+This freed enough space to get back to 6+ GB free on the root partition.
+
+**Challenges faced:**
+
+- The `RegisterOffsets` whitelist is not obvious — the pattern in the codebase is that you define a Go constant, define a matching C enum value, add the field to `offsets.json`, and add a DWARF scan entry. Nobody warns you there's a *fourth* step (adding to the whitelist). Missing any one of the four steps silently produces `offset=0` with no error message.
+- Disk-full errors look like application bugs. The test failure (HTTP 500, `mongo_conn=0`) pointed toward a BPF verifier issue or a timing problem, but the actual cause was MongoDB crashing on startup before any of our eBPF code even ran.
+- `docker system prune -a --volumes` is destructive — it removes all images, so the next test run has to re-download and rebuild everything from scratch (adds ~20 minutes to the first run after a prune).
+
+**Current status:**
+
+- `RegisterOffsets` fix applied ✓
+- `offsets.json` has `Deployment = 24` ✓
+- Disk freed, MongoDB can start again ✓
+- Next: rerun `make oats-test-mongo` and verify `deployment_offset=24` appears in the kernel trace and `server.address: mongo` passes
 
 **Branch:** [mongo-connection](https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation/tree/mongo-connection)
 
