@@ -8,7 +8,7 @@
 
 **Issue:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
 
-**Status:** Implementation Complete — Testing in Progress
+**Status:** Phase IV - PR raised
 
 ---
 
@@ -950,7 +950,7 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe | grep mongo
 
 ## Pull Request
 
-**PR Link:** Not submitted yet
+**PR Link:** https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/pull/3052
 
 **PR Description:** Drafted in [PR_DESCRIPTION.md](PR_DESCRIPTION.md)
 
@@ -958,7 +958,7 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe | grep mongo
 - None yet
 - The draft PR is prepared before submission so review notes can be added here later
 
-**Status:** Drafted, not submitted yet
+**Status:** Awaiting review
 
 ---
 
