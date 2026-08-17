@@ -14,9 +14,9 @@
 
 ## Why I Chose This Issue
 
-[1-2 paragraphs explaining why this issue interests you, how it matches your skills/learning goals, what you hope to learn]
+This issue sits at a point where several topics I want to get better at meet: Go internals, eBPF instrumentation, and MongoDB behavior. The bug itself is small enough to reason about, but the path to fix it touches multiple layers of the system, which makes it a strong learning opportunity instead of a narrow one-file change.
 
-This issue deals with mongo database configuration, and given my background with system and recently starting to work more with Mongo DB at work, this issue offers an opportunity to dig into the Mongo configuration. Since this will be my very first open-source contribution, I'm hoping to learn and experience the end-to-end process first as a stepping stone. 
+It also matches my current goals well. I wanted a first open-source contribution that would force me to understand how a production-oriented codebase is structured, how tracing data moves from kernel space to user space, and how to validate a change with both unit tests and end-to-end integration coverage.
 
 ---
 
@@ -24,27 +24,27 @@ This issue deals with mongo database configuration, and given my background with
 
 ### Problem Description
 
-[In your own words, what's broken or missing?]
-
-Mongo connection detail does not include hostname, so this issue is to determine the Mongo database hostname from the connection string. Hostname is more descriptive and human-friendly compared to IP addresses or random strings. 
+MongoDB spans emitted by the Go tracer do not carry the configured server hostname. The application connects with a URI such as `mongodb://mongo:27017`, but the instrumentation only reports the raw socket IP on the server side, so `server.address` ends up as an IP instead of a meaningful hostname.
 
 ### Expected Behavior
 
-[What should happen?]
-
-Upon successfully completion of this issue, Mongo DB hostname can be determined and logged based on connection string.
+After the fix, the MongoDB span should preserve the configured host name from the driver and export it as `server.address`. In the test environment, the destination should change from `172.18.x.x as 172.18.x.x:27017` to `172.18.x.x as mongo:27017`, while `server.port` remains `27017`.
 
 ### Current Behavior
 
-[What actually happens?]
-
-Only Mongo conenction string is available, no hostname.
+Today the hostname is never carried through the MongoDB event pipeline. `mongo_go_client_req_t` has no hostname field, the eBPF probe does not extract one from the driver, and the userspace transform falls back to the IP-derived host string from the socket tuple.
 
 ### Affected Components
 
-[Which parts of the codebase are involved?]
+The change spans both the kernel and userspace paths:
 
-Code change in `go_mongo.c` , references available in `go_sql.c`, specifically the `read_mysql_hostname_from_mysqlconn()`.
+- `pkg/internal/goexec/structmembers.go` for DWARF offset discovery hardening
+- `bpf/common/common.h` for the MongoDB event struct
+- `bpf/gotracer/go_offsets.h` and `pkg/internal/ebpf/gotracer/gotracer.go` for offset registration
+- `configs/offsets/tracker_input.json` for tracked MongoDB offsets
+- `bpf/gotracer/go_common.h`, `bpf/gotracer/maps/mongo.h`, `bpf/gotracer/go_net_common.h`, and `bpf/gotracer/go_mongo.c` for the eBPF extraction path
+- `pkg/ebpf/common/mongo_detect_transform.go` for the span transform
+- `internal/test/oats/mongo/yaml/oats_go_mongo.yaml` and `oats_go_mongo_v2.yaml` for the integration assertions
 
 ---
 
@@ -52,7 +52,6 @@ Code change in `go_mongo.c` , references available in `go_sql.c`, specifically t
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
 Setting up the local development environment on Windows 10 required a few extra steps since eBPF is a Linux kernel technology and cannot run natively on Windows.
 
 **Challenge 1: eBPF does not run on Windows**
@@ -401,60 +400,60 @@ The SQL instrumentation in `bpf/gotracer/go_sql.c` already does this exact patte
 
 ### Proposed Solution
 
-[High-level description of your fix approach]
+Follow the same general model already used by the SQL instrumentation, but adapt it to the MongoDB driver's internal layout. The fix needs to carry a hostname through the full path: discover the right Go struct offsets, read the configured seed host from the driver's topology config in eBPF, store it in the MongoDB event, and then prefer that hostname in the userspace span transform. The fallback behavior should remain safe: if offsets are missing or a read fails, the span should still be emitted and continue to use the socket IP.
 
 ### Implementation Plan
 
 Using UMPIRE framework (adapted):
 
-**Understand:** 
-MongoDB spans produced by the eBPF instrumentation are missing the `server.address` attribute. The connection string (e.g., `mongodb://mongo:27017`) contains the hostname, but `go_mongo.c` never reads or stores it — the `mongo_go_client_req_t` struct has no hostname field, so the user-space transform has nothing to emit as `server.address`.
+**Understand:**
+MongoDB spans produced by the eBPF instrumentation are missing the `server.address` attribute. The connection string (e.g., `mongodb://mongo:27017`) contains the hostname, but the current MongoDB path never carries that hostname into the exported span.
 
 **Match:**
-`go_sql.c` solves the identical problem for MySQL and PostgreSQL. It reads a hostname string by dereferencing a pointer chain from the driver connection struct into an internal config field (`mysqlConn.cfg.Addr`, `pgx.Conn.config.Host`). The offset for that field is registered in `go_offsets.h`, injected at eBPF load time, and the string is extracted with `read_go_str()`. The MongoDB equivalent pointer chain starts from the `Operation` struct (already available in `obi_uprobe_mongo_op_execute`) via its `Deployment` interface field, which holds a `*topology.Topology` whose `servers` map entry contains a `description.Server` with an `Addr` string field.
+`go_sql.c` solves the same problem for MySQL and PostgreSQL. It reads a hostname from driver-owned configuration, stores it in the event, and then prefers that hostname in the userspace transform. MongoDB needs the same outcome, but the pointer chain is different: `driver.Operation` exposes a `Deployment` interface that points to `*topology.Topology`, whose config holds `SeedList[0]` such as `mongo:27017`.
 
 **Plan:**
-1. **[bpf/common/common.h]** — Add `unsigned char hostname[k_mongo_hostname_max_len]` field to `mongo_go_client_req_t`. Define a dedicated `k_mongo_hostname_max_len = 96` constant rather than reusing `k_sql_hostname_max_len` — MongoDB hostnames are shorter than full SQL payloads (96 bytes is sufficient for `"hostname:27017"`) and keeping it separate avoids coupling two unrelated protocols.
-2. **[bpf/gotracer/go_offsets.h]** — Add a new offset entry (e.g., `_mongo_server_addr_pos`) for the address string field inside the MongoDB driver's topology server struct.
-3. **[bpf/gotracer/go_mongo.c]** — In `obi_uprobe_mongo_op_execute`, after reading `req->db`, dereference `Operation.Deployment` → `topology.Topology` → server address string and store it in `req->hostname` using `read_go_str()`.
-4. **[pkg/ebpf/common/mongo_detect_transform.go]** — Read `req.hostname` from the eBPF event and set it as the `server.address` span attribute (mirror how the SQL transform handles `trace.hostname`).
-5. **[internal/test/oats/mongo/yaml/oats_go_mongo.yaml]** — Add `server.address: 'mongo'` to the expected attributes on the MongoDB span assertion.
+1. **[pkg/internal/goexec/structmembers.go]** - Harden `readMembers` so unnamed DWARF members and non-constant member locations do not abort the rest of offset discovery.
+2. **[bpf/common/common.h]** and **[pkg/ebpf/common/mongo_detect_transform.go]** - Add a hostname field to `mongo_go_client_req_t`, regenerate the mirrored Go struct, and wire that field into the MongoDB span transform.
+3. **[pkg/internal/goexec/structmembers.go]**, **[pkg/internal/ebpf/gotracer/gotracer.go]**, **[bpf/gotracer/go_offsets.h]**, and **[configs/offsets/tracker_input.json]** - Register the offsets needed for `Operation.Deployment`, `Topology.cfg`, and `Config.SeedList`, taking the driver-version differences into account.
+4. **[bpf/gotracer/go_common.h]**, **[bpf/gotracer/maps/mongo.h]**, **[bpf/gotracer/go_net_common.h]**, and **[bpf/gotracer/go_mongo.c]** - Keep the in-flight MongoDB map value small enough for the verifier, capture the concrete deployment pointer, and read `SeedList[0]` directly into ring-buffer memory in the return probe.
+5. **[internal/test/oats/mongo/yaml/oats_go_mongo.yaml]** and **[internal/test/oats/mongo/yaml/oats_go_mongo_v2.yaml]** - Assert `server.address: mongo` in the Go MongoDB OATS coverage.
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** Working branch noted in the planning document: `mongo-connection-v3` (based on `main` at `cad6aa9a`)
 
 **Review:**
-- [ ] New struct field does not break struct layout alignment (padding may be needed)
-- [ ] Offset key follows the existing `_mongo_*` naming convention in `go_offsets.h`
-- [ ] `read_go_str` call is guarded with a `bpf_dbg_printk` on failure, matching the style of other reads in `go_mongo.c`
-- [ ] Transform sets `server.address` only when the hostname field is non-empty (avoid emitting blank attribute)
-- [ ] Contribution follows CONTRIBUTING.md — DCO sign-off on commits
+- [ ] New MongoDB fields and offsets are appended without breaking the positional Go/C offset mapping
+- [ ] The MongoDB hostname is extracted from `SeedList[0]` without copying credentials from a full URI
+- [ ] The in-flight map value stays small enough to avoid the eBPF stack overflow seen in earlier attempts
+- [ ] The existing synthesized-request fallback in `op_execute` is preserved
+- [ ] Contribution follows CONTRIBUTING.md and the AI disclosure guidance in `AI-POLICY.md`
 
 **Evaluate:**
-Run the OATS test locally after the fix:
-​```bash
-cd internal/test/oats/mongo
-docker compose -f docker-compose-go-mongo.yml up --build
-curl http://localhost:8080/mongo
-docker compose -f docker-compose-go-mongo.yml logs autoinstrumenter
-​```
-The span for `insert testdb.items` should now include `server.address: mongo`. The OATS assertion in `oats_go_mongo.yaml` will also catch regressions automatically in CI.
+Verify the change incrementally instead of waiting until the end:
+```bash
+go test -run 'TestReadMembers|TestGoOffsetsFromDwarf' ./pkg/internal/goexec/
+go test -run Mongo ./pkg/ebpf/common/
+go test -run TestRawTraceDispatcher ./pkg/ebpf/common/
+make compile
+make oats-test-mongo
+```
+The expected end-to-end result is that MongoDB spans change from `...[172.18.x.x as 172.18.x.x:27017]` to `...[172.18.x.x as mongo:27017]`, and the OATS assertions pass with `server.address: mongo`.
 
 ## Testing Strategy
-
 ### Unit Tests
 
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
+- [ ] `go test -run 'TestReadMembers|TestGoOffsetsFromDwarf' ./pkg/internal/goexec/` to confirm DWARF offset discovery keeps scanning after unnamed or unsupported members
+- [ ] `go test -run Mongo ./pkg/ebpf/common/` to validate MongoDB hostname parsing and `HostName` propagation in the span transform
+- [ ] `go test -run TestRawTraceDispatcher ./pkg/ebpf/common/` to catch any event-size or struct-layout mismatch after the new hostname field is added
 
 ### Integration Tests
 
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
+- [ ] Build the MongoDB integration components for both supported driver majors and verify `Deployment`, `Topology.cfg`, and `Config.SeedList` offsets resolve from DWARF
+- [ ] Run `make oats-test-mongo` and confirm both Go MongoDB YAML suites pass with `server.address: mongo`
 
 ### Manual Testing
 
-[What you tested manually and results]
+Manual verification should focus on the span lines printed by the autoinstrumenter. The useful before/after check is `grep MongoClient` on the OATS output log: before the fix the right-hand side ends in `as 172.18.x.x:27017`, and after the fix it should end in `as mongo:27017`. While debugging the eBPF path, `trace_pipe` output is also useful to confirm each pointer hop succeeds and to distinguish missing offsets from failed reads.
 
 ---
 
@@ -485,7 +484,7 @@ The span for `insert testdb.items` should now include `server.address: mongo`. T
 
 **Branch:** [mongo-connection](https://github.com/keyuyan1145/opentelemetry-ebpf-instrumentation/tree/mongo-connection)
 
-**Key commits:** [Link when committed]
+**Key commits:** Not recorded yet
 
 ---
 
@@ -951,15 +950,15 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe | grep mongo
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when submitted]
+**PR Link:** Not submitted yet
 
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
+**PR Description:** Drafted in [PR_DESCRIPTION.md](PR_DESCRIPTION.md)
 
 **Maintainer Feedback:**
-- [Date]: [Summary of feedback received]
-- [Date]: [How you addressed it]
+- None yet
+- The draft PR is prepared before submission so review notes can be added here later
 
-**Status:** [Awaiting review / Iterating / Approved / Merged]
+**Status:** Drafted, not submitted yet
 
 ---
 
@@ -967,20 +966,28 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe | grep mongo
 
 ### Technical Skills Gained
 
-[What you learned technically]
+This issue taught me how much of OBI's behavior depends on the boundary between Go runtime layout and eBPF reads. I learned how the project discovers Go struct member offsets through DWARF and pre-fetched offset data, why the Go and C offset enums have to stay positionally aligned, and how small mistakes in that pipeline silently degrade to `offset=0`.
+
+I also learned more about the MongoDB Go driver's internal shape than I expected. The workable path here is `Operation.Deployment -> *topology.Topology -> cfg -> SeedList[0]`, and understanding that required reasoning about Go interfaces, pointers, and slice headers rather than only application-level MongoDB code.
 
 ### Challenges Overcome
 
-[What was hard and how you solved it]
+The hardest part was that the failure mode looked identical at several layers. A missing offset, an eBPF read failure, or an incomplete userspace transform could all end with the same visible symptom: MongoDB spans still showing an IP address. The planning notes helped break that apart into smaller verification steps so each layer could be checked independently.
+
+Environment setup was also a real challenge. Running Linux eBPF tooling from a Windows 10 machine meant dealing with WSL2, Docker Compose version mismatches, VM setup, missing toolchain pieces, and later even disk exhaustion in Docker. Working through those problems was time-consuming, but it made the later debugging process much more concrete because I had a repeatable path to reproduce the issue.
 
 ### What I'd Do Differently Next Time
 
-[Reflection on your process]
+Next time I would validate the offset-discovery path earlier instead of jumping to the end-to-end eBPF behavior too quickly. The planning document makes it clear that offset bugs can fail silently, so a small targeted check against the generated test binaries would have saved time.
+
+I would also keep the iteration loop smaller from the start: cheap package tests for `pkg/ebpf/common`, focused DWARF checks for `pkg/internal/goexec`, and the full OATS run only after those pieces are green. That sequence is much more efficient than debugging everything from a long Docker-based integration test.
 
 ---
 
 ## Resources Used
 
-- [Link to helpful documentation]
-- [Tutorial or Stack Overflow post that helped]
-- [GitHub issues or discussions that helped]
+- Issue discussion: https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1192
+- Repository guidance: `AGENTS.md`, `AI-POLICY.md`, and `devdocs/pipeline-map.md`
+- eBPF reference documentation: https://docs.ebpf.io/linux/
+- OpenTelemetry documentation: https://opentelemetry.io/docs/
+
